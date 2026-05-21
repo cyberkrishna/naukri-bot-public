@@ -6,7 +6,7 @@ databases:
 
 services:
   - type: web
-    name: naukri-bot-worker
+    name: naukri-bot-web
     runtime: docker
     plan: free
     region: singapore
