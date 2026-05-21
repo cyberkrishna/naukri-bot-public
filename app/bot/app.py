@@ -14,6 +14,7 @@ from app.bot.handlers import (
     set_locations,
     start,
     status,
+    test_deliver,
     unsubscribe,
 )
 from app.config import (
@@ -75,6 +76,7 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("pause", pause))
     application.add_handler(CommandHandler("resume", resume))
     application.add_handler(CommandHandler("unsubscribe", unsubscribe))
+    application.add_handler(CommandHandler("test_deliver", test_deliver))
     return application
 
 

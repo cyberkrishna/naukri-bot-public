@@ -1,10 +1,13 @@
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
+from app.config import ADMIN_CHAT_ID
 from app.db import session_scope
+from app.delivery import deliver_one
 from app.models import SentJob, User
 
 WELCOME = (
@@ -325,5 +328,23 @@ async def unsubscribe(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         u.status = "unsubscribed"
     await update.message.reply_text(
         "👋 Unsubscribed. No more jobs will be sent. Send /start anytime to resubscribe.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def test_deliver(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: force an immediate delivery to the admin's own chat.
+
+    Runs deliver_one in a thread because it uses sync requests + sqlalchemy.
+    """
+    chat = update.effective_chat
+    if chat is None:
+        return
+    if ADMIN_CHAT_ID == 0 or chat.id != ADMIN_CHAT_ID:
+        return  # silently ignore for non-admins
+    await update.message.reply_text("⏳ Running delivery now…", parse_mode=ParseMode.HTML)
+    sent, failed = await asyncio.to_thread(deliver_one, chat.id, False)
+    await update.message.reply_text(
+        f"✅ delivery done: jobs_sent={sent} batches_failed={failed}",
         parse_mode=ParseMode.HTML,
     )
