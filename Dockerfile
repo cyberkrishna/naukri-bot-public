@@ -9,6 +9,7 @@ RUN pip install --no-cache-dir -e .
 # Now copy the application source
 COPY . .
 
-# Default command is set per service in render.yaml.
-# Local sanity-check default: print Python + Playwright versions and exit.
-CMD ["python", "-c", "import sys, playwright; print(f'Python {sys.version}'); print(f'Playwright {playwright.__version__}')"]
+# Make startup script executable.
+RUN chmod +x /app/start.sh
+
+CMD ["/app/start.sh"]
