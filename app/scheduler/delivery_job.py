@@ -10,8 +10,8 @@ log = logging.getLogger("delivery_job")
 def run(dry_run: bool = False) -> None:
     stats = deliver_due(dry_run=dry_run)
     log.info(
-        "delivery done: users=%d jobs_sent=%d errors=%d",
-        stats["users"], stats["jobs_sent"], stats["errors"],
+        "delivery done: users=%d jobs_sent=%d batches_failed=%d errors=%d",
+        stats["users"], stats["jobs_sent"], stats["batches_failed"], stats["errors"],
     )
 
 
