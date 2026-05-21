@@ -1,17 +1,24 @@
-"""Unified entrypoint for Render's Background Worker.
+"""Unified entrypoint for Render's Web Service (free tier).
 
 Runs in a single process, sharing one asyncio event loop:
   - python-telegram-bot in polling mode (handles user commands)
   - APScheduler with three cron jobs (scrape, deliver, prune)
+  - Tornado HTTP server exposing /healthz so Render keeps the service alive
+  - Optional self-ping job that hits /healthz every 12 min so free-tier
+    Web Services (which sleep after 15 min idle) don't suspend the scheduler
 
 The scheduler jobs are sync; we hand them to asyncio's default executor so
 they don't block the event loop while Playwright is running.
 """
 import asyncio
 import logging
+import os
 
+import httpx
+import tornado.web
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
+from apscheduler.triggers.interval import IntervalTrigger
 
 from app.bot.app import build_app
 from app.config import assert_runtime_env
@@ -48,6 +55,29 @@ async def _scheduled_prune():
     await _run_blocking(prune_job.run)
 
 
+async def _scheduled_self_ping():
+    """Hit our own /healthz so Render's free-tier 15-min idle sleep doesn't suspend us."""
+    url = os.environ.get("RENDER_EXTERNAL_URL", "").rstrip("/")
+    if not url:
+        return  # not on Render or var not set
+    try:
+        async with httpx.AsyncClient(timeout=10) as client:
+            r = await client.get(f"{url}/healthz")
+            log.info("self-ping %s -> %s", url, r.status_code)
+    except Exception as e:
+        log.warning("self-ping failed: %s", e)
+
+
+class HealthHandler(tornado.web.RequestHandler):
+    def get(self):
+        self.set_header("Content-Type", "text/plain")
+        self.write("ok")
+
+
+def build_http_app() -> tornado.web.Application:
+    return tornado.web.Application([(r"/healthz", HealthHandler), (r"/", HealthHandler)])
+
+
 def build_scheduler() -> AsyncIOScheduler:
     sched = AsyncIOScheduler(timezone="UTC")
     sched.add_job(
@@ -73,6 +103,15 @@ def build_scheduler() -> AsyncIOScheduler:
         max_instances=1,
         coalesce=True,
     )
+    # Self-ping every 12 min to defeat Render free-tier 15-min idle sleep.
+    # No-op when RENDER_EXTERNAL_URL isn't set (e.g. local dev).
+    sched.add_job(
+        _scheduled_self_ping,
+        IntervalTrigger(minutes=12),
+        id="self_ping",
+        max_instances=1,
+        coalesce=True,
+    )
     return sched
 
 
@@ -80,6 +119,12 @@ async def amain() -> None:
     assert_runtime_env()
     app = build_app()
     sched = build_scheduler()
+    http_app = build_http_app()
+
+    # Render injects PORT; local dev falls back to 8080.
+    port = int(os.environ.get("PORT", "8080"))
+    http_server = http_app.listen(port, address="0.0.0.0")
+    log.info("http: listening on 0.0.0.0:%d (/healthz)", port)
 
     log.info(
         "worker: starting bot (polling) + scheduler (%s)",
@@ -100,6 +145,7 @@ async def amain() -> None:
         await asyncio.Event().wait()
     finally:
         log.info("worker: shutting down")
+        http_server.stop()
         await app.updater.stop()
         sched.shutdown(wait=False)
         await app.stop()

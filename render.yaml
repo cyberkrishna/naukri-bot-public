@@ -5,13 +5,14 @@ databases:
     user: naukri_bot
 
 services:
-  - type: worker
+  - type: web
     name: naukri-bot-worker
     runtime: docker
     plan: free
     region: singapore
     dockerfilePath: ./Dockerfile
     dockerCommand: sh -c "alembic upgrade head && python -m app.worker"
+    healthCheckPath: /healthz
     envVars:
       - key: BOT_MODE
         value: polling
