@@ -1,0 +1,20 @@
+# Broad superset of search queries that the scraper crawls every 6h.
+# Per-user filtering happens at delivery time against the resulting jobs_pool.
+# Add or refine queries here; restart the worker to pick up changes.
+
+queries:
+  - python developer
+  - java developer
+  - software engineer fresher
+  - machine learning engineer
+  - data analyst
+  - data scientist
+  - ai ml intern
+  - python intern
+  - data science intern
+  - backend engineer
+  - frontend developer
+  - full stack developer
+  - devops engineer
+  - cloud engineer
+  - sde 1
