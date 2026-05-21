@@ -9,7 +9,7 @@ services:
     name: naukri-bot-web
     runtime: docker
     plan: free
-    region: singapore
+    region: oregon
     dockerfilePath: ./Dockerfile
     healthCheckPath: /healthz
     envVars:
