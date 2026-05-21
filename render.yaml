@@ -1,0 +1,25 @@
+databases:
+  - name: naukri-bot-db
+    plan: free
+    databaseName: naukri_bot
+    user: naukri_bot
+
+services:
+  - type: worker
+    name: naukri-bot-worker
+    runtime: docker
+    plan: free
+    region: singapore
+    dockerfilePath: ./Dockerfile
+    dockerCommand: sh -c "alembic upgrade head && python -m app.worker"
+    envVars:
+      - key: BOT_MODE
+        value: polling
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_CHAT_ID
+        sync: false
+      - key: DB_URL
+        fromDatabase:
+          name: naukri-bot-db
+          property: connectionString

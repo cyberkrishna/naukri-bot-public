@@ -19,11 +19,22 @@ def _optional(key: str, default: str = "") -> str:
 
 BOT_TOKEN = _optional("BOT_TOKEN")
 BOT_MODE = _optional("BOT_MODE", "polling").lower()
-DB_URL = _optional("DB_URL", "sqlite:///./bot.db")
+def _normalize_db_url(raw: str) -> str:
+    """Render-managed Postgres ships as 'postgres://…'. SQLAlchemy 2.x wants
+    the 'postgresql+psycopg://…' form. Rewrite to the explicit driver."""
+    if raw.startswith("postgres://"):
+        return "postgresql+psycopg://" + raw[len("postgres://"):]
+    if raw.startswith("postgresql://") and "+psycopg" not in raw:
+        return "postgresql+psycopg://" + raw[len("postgresql://"):]
+    return raw
+
+
+DB_URL = _normalize_db_url(_optional("DB_URL", "sqlite:///./bot.db"))
 WEBHOOK_URL = _optional("WEBHOOK_URL")
 WEBHOOK_SECRET = _optional("WEBHOOK_SECRET")
 WEBHOOK_LISTEN = _optional("WEBHOOK_LISTEN", "0.0.0.0")
-WEBHOOK_PORT = int(_optional("WEBHOOK_PORT", "8080") or "8080")
+# Render injects PORT for web services. Fall back to WEBHOOK_PORT for local use.
+WEBHOOK_PORT = int(_optional("PORT", "") or _optional("WEBHOOK_PORT", "8080") or "8080")
 ADMIN_CHAT_ID = int(_optional("ADMIN_CHAT_ID", "0") or "0")
 QUERIES_PATH = Path(_optional("QUERIES_PATH", "app/queries.yaml"))
 
