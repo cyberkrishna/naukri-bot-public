@@ -2,7 +2,7 @@
 name = "naukri-bot-public"
 version = "0.1.0"
 description = "Public multi-user Telegram bot delivering filtered Naukri job alerts"
-requires-python = ">=3.11,<3.13"
+requires-python = ">=3.10,<3.13"
 dependencies = [
     "python-telegram-bot[rate-limiter,webhooks]==21.6",
     "sqlalchemy==2.0.35",
@@ -33,7 +33,7 @@ include = ["app*"]
 
 [tool.ruff]
 line-length = 100
-target-version = "py311"
+target-version = "py310"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
