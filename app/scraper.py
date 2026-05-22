@@ -29,6 +29,7 @@ WARMUP_URL = "https://www.naukri.com/python-developer-jobs?experience=0&sortBy=d
 _STATIC_HEADERS = {
     "appid": "109",
     "systemid": "Naukri",
+    "clientid": "d3skt0p",
     "Accept": "application/json",
     "Accept-Language": "en-US,en;q=0.9",
     "Referer": "https://www.naukri.com/",
@@ -154,15 +155,22 @@ def _harvest_credentials() -> tuple[dict[str, str], dict[str, str]] | None:
                         "page may be fully SSR'd or blocked by JS")
         browser.close()
 
-    if "nkparam" not in captured:
-        log.warning("scraper: harvest finished without capturing nkparam — "
-                    "Naukri may have changed the header name or blocked the page")
-        return None
-
     cookies = {c["name"]: c["value"] for c in cookie_list
                if "naukri.com" in c.get("domain", "")}
-    headers = {**_STATIC_HEADERS, "nkparam": captured["nkparam"]}
-    log.info("scraper: harvest ok, cookies=%d", len(cookies))
+    headers = dict(_STATIC_HEADERS)
+    if "nkparam" in captured:
+        headers["nkparam"] = captured["nkparam"]
+        log.info("scraper: harvest ok with nkparam, cookies=%d", len(cookies))
+    else:
+        # nkparam isn't used on Naukri's own SRP XHRs we observed — only the
+        # static appid/systemid/clientid headers + cookies. Try the API
+        # without nkparam; if it 403s, _api_search will log the body so we
+        # can adjust.
+        log.info("scraper: harvest finished WITHOUT nkparam, cookies=%d — "
+                 "attempting API call anyway with appid+cookies", len(cookies))
+    if not cookies:
+        log.warning("scraper: NO cookies harvested either — API call will likely 403")
+        return None
     return headers, cookies
 
 
