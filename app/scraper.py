@@ -1,13 +1,20 @@
-"""Scrape Naukri using its internal JSON API.
+"""Scrape Naukri by extracting the SSR'd __NEXT_DATA__ JSON from search pages.
 
-Strategy: launch one Chromium session, navigate to a Naukri search page, and
-capture the `nkparam` request header (and cookies) from the page's own outgoing
-XHR to `/jobapi/v3/search`. Then hit that same endpoint directly with
-`requests` for every query — fast, structured JSON, no per-query browser
-navigation. Falls back to logging rich diagnostics if anything fails.
+Naukri is a Next.js app — every search results page embeds the full job
+listing as JSON inside `<script id="__NEXT_DATA__">`. We load each query's
+SRP with Playwright (one Chromium session reused across queries) and parse
+the JSON straight out of the HTML.
 
-See https://github.com/Traverser25/NopeRi for the technique.
+Why this beats every other path:
+- No /jobapi/v3/search call → no `recaptcha required` 406s (which is what
+  the JSON API returns from Render's IP).
+- No `nkparam` token to harvest, no header signing to reverse-engineer.
+- No fragile CSS selectors — the JSON shape is what Next.js ships to its
+  own client-side hydration, far more stable than rendered DOM classes.
+- Cookies + stealth make the HTML page itself reachable; that's the only
+  thing we need.
 """
+import json
 import logging
 import re
 import time
@@ -15,30 +22,19 @@ import urllib.parse
 from dataclasses import dataclass, asdict
 from typing import Iterable
 
-import requests
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
 from playwright_stealth import stealth_sync
 
 log = logging.getLogger("scraper")
 
-API_URL = "https://www.naukri.com/jobapi/v3/search"
-WARMUP_URL = "https://www.naukri.com/python-developer-jobs?experience=0&sortBy=date"
+_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+       "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
-# Headers Naukri's own browser fetch sends with the XHR. `nkparam` and cookies
-# are filled in at harvest time; the rest are stable.
-_STATIC_HEADERS = {
-    "appid": "109",
-    "systemid": "Naukri",
-    "clientid": "d3skt0p",
-    "Accept": "application/json",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.naukri.com/",
-    "Origin": "https://www.naukri.com",
-    "User-Agent": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-    ),
-}
+# Matches the Next.js data script tag. Naukri uses the standard Next layout.
+_NEXT_DATA_RE = re.compile(
+    r'<script id="__NEXT_DATA__"[^>]*>(.+?)</script>',
+    re.DOTALL,
+)
 
 
 @dataclass
@@ -57,128 +53,63 @@ class Job:
         return asdict(self)
 
 
-def build_url(query: str, experience_years: int, locations: list[str]) -> str:
-    """Build the public search-page URL — used for the harvest warm-up and as a
-    fallback Job.url when the API row doesn't include one."""
+def build_url(query: str, experience_years: int, locations: list[str],
+              page_no: int = 1) -> str:
     slug = query.strip().lower().replace(" ", "-")
     loc_slug = "-".join(l.strip().lower() for l in locations) if locations else ""
     path = f"{slug}-jobs"
     if loc_slug:
         path = f"{slug}-jobs-in-{loc_slug}"
     params = {"experience": str(experience_years), "sortBy": "date"}
-    return f"https://www.naukri.com/{path}?{urllib.parse.urlencode(params)}"
+    url = f"https://www.naukri.com/{path}?{urllib.parse.urlencode(params)}"
+    if page_no > 1:
+        url += f"&pageNo={page_no}"
+    return url
 
 
-def _extract_job_id(href: str) -> str:
-    m = re.search(r"-(\d+)(?:\?|$)", href)
-    return m.group(1) if m else href
+def _walk_for_job_rows(obj) -> list[dict]:
+    """Recursively walk a JSON tree looking for the Naukri jobs array.
 
-
-def _harvest_credentials() -> tuple[dict[str, str], dict[str, str]] | None:
-    """Open a real Chromium, navigate to a Naukri search page, and capture the
-    `nkparam` header from the page's own XHR plus the cookie jar.
-
-    Returns (headers, cookies) or None on failure. Headers always include
-    `nkparam` if successful; cookies include the full set Naukri set during
-    the page load (CSRF, session, etc.).
+    Naukri's __NEXT_DATA__ shape is roughly:
+      props.pageProps.jobDetails / .srpResultDetails.jobDetails / etc.
+    Rather than hardcode the path (it has shifted across rewrites), we
+    walk the tree and pick the first list whose items look like Naukri job
+    rows. A Naukri job row reliably has a `jobId` key.
     """
-    captured: dict[str, str] = {}
-    # Track every /jobapi/* request we observe so we can debug when nkparam
-    # isn't appearing (wrong endpoint? renamed header? no XHR at all?).
-    seen_jobapi_urls: list[str] = []
+    found: list[dict] = []
 
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True, args=[
-            "--disable-blink-features=AutomationControlled",
-            "--no-sandbox",
-        ])
-        context = browser.new_context(
-            user_agent=_STATIC_HEADERS["User-Agent"],
-            viewport={"width": 1366, "height": 900},
-            locale="en-US",
-        )
-        page = context.new_page()
-        stealth_sync(page)
+    def _is_job_row(d) -> bool:
+        if not isinstance(d, dict):
+            return False
+        # jobId / title / companyName are the stable trio.
+        has_id = any(k in d for k in ("jobId", "jobid"))
+        has_title = "title" in d
+        return has_id and has_title
 
-        def _on_request(req):
-            if "/jobapi/" not in req.url:
-                return
-            # Always log so we can SEE what the page is calling.
-            hdr_keys = sorted(req.headers.keys())
-            seen_jobapi_urls.append(req.url)
-            log.info("scraper: jobapi request url=%s headers=%s",
-                     req.url[:160], hdr_keys)
-            if "nkparam" in req.headers and "nkparam" not in captured:
-                captured["nkparam"] = req.headers["nkparam"]
-                log.info("scraper: harvested nkparam (len=%d)",
-                         len(captured["nkparam"]))
+    def _walk(node):
+        if isinstance(node, list):
+            if node and _is_job_row(node[0]):
+                found.extend(item for item in node if _is_job_row(item))
+                # Don't return — there may be multiple lists (e.g. ads).
+            for item in node:
+                _walk(item)
+        elif isinstance(node, dict):
+            for v in node.values():
+                _walk(v)
 
-        page.on("request", _on_request)
-
-        try:
-            resp = page.goto(WARMUP_URL, wait_until="domcontentloaded", timeout=30000)
-            status = resp.status if resp is not None else "n/a"
-            log.info("scraper: warmup status=%s url=%s", status, WARMUP_URL)
-            try:
-                page.wait_for_load_state("networkidle", timeout=10000)
-            except PWTimeout:
-                pass
-
-            # The first SRP is server-rendered, so no /jobapi/v3/search XHR
-            # fires on initial load. Force one by triggering an in-page
-            # interaction that Naukri handles client-side via the API:
-            # navigating to page 2 of results. The pageNo=2 variant of the
-            # search URL always uses the JSON API for hydration.
-            if "nkparam" not in captured:
-                try:
-                    page.goto(WARMUP_URL + "&pageNo=2",
-                              wait_until="domcontentloaded", timeout=20000)
-                    page.wait_for_timeout(2500)
-                except Exception as e:
-                    log.warning("scraper: pageNo=2 nav failed: %s", e)
-
-            # Last-resort: scroll to trigger any lazy XHR.
-            if "nkparam" not in captured:
-                try:
-                    for _ in range(3):
-                        page.mouse.wheel(0, 1500)
-                        page.wait_for_timeout(700)
-                except Exception:
-                    pass
-
-        except Exception as e:
-            log.warning("scraper: warmup navigation failed: %s", e)
-
-        cookie_list = context.cookies()
-        if not seen_jobapi_urls:
-            log.warning("scraper: NO /jobapi/* requests observed at all — "
-                        "page may be fully SSR'd or blocked by JS")
-        browser.close()
-
-    cookies = {c["name"]: c["value"] for c in cookie_list
-               if "naukri.com" in c.get("domain", "")}
-    headers = dict(_STATIC_HEADERS)
-    if "nkparam" in captured:
-        headers["nkparam"] = captured["nkparam"]
-        log.info("scraper: harvest ok with nkparam, cookies=%d", len(cookies))
-    else:
-        # nkparam isn't used on Naukri's own SRP XHRs we observed — only the
-        # static appid/systemid/clientid headers + cookies. Try the API
-        # without nkparam; if it 403s, _api_search will log the body so we
-        # can adjust.
-        log.info("scraper: harvest finished WITHOUT nkparam, cookies=%d — "
-                 "attempting API call anyway with appid+cookies", len(cookies))
-    if not cookies:
-        log.warning("scraper: NO cookies harvested either — API call will likely 403")
-        return None
-    return headers, cookies
+    _walk(obj)
+    # Dedup by jobId in case multiple list paths overlap.
+    seen: set[str] = set()
+    uniq: list[dict] = []
+    for r in found:
+        jid = str(r.get("jobId") or r.get("jobid") or "")
+        if jid and jid not in seen:
+            seen.add(jid)
+            uniq.append(r)
+    return uniq
 
 
-def _parse_api_row(row: dict, query: str) -> Job | None:
-    """Map one JSON row from /jobapi/v3/search into our Job dataclass.
-
-    The API field names have been stable for years but we treat all of them as
-    optional — defensive against future shape changes."""
+def _parse_row(row: dict, query: str) -> Job | None:
     try:
         job_id = str(row.get("jobId") or row.get("jobid") or "")
         if not job_id:
@@ -186,22 +117,37 @@ def _parse_api_row(row: dict, query: str) -> Job | None:
         title = (row.get("title") or "").strip()
         company = (row.get("companyName") or row.get("company") or "").strip()
         experience = (row.get("experienceText") or row.get("experience") or "").strip()
-        # Locations can be a list of {label} dicts or a comma-joined string.
-        loc_field = row.get("placeholders") or []
+
+        # Location: prefer placeholders[type=location].label; fall back to flat fields.
         location = ""
-        for ph in loc_field if isinstance(loc_field, list) else []:
-            if isinstance(ph, dict) and ph.get("type") == "location":
-                location = ph.get("label", "").strip()
-                break
+        ph = row.get("placeholders") or []
+        if isinstance(ph, list):
+            for p in ph:
+                if isinstance(p, dict) and p.get("type") == "location":
+                    location = (p.get("label") or "").strip()
+                    break
         if not location:
             location = (row.get("location") or row.get("locationText") or "").strip()
+
+        # Salary placeholder (helpful free signal; we don't model it yet but
+        # show it in description so users can see).
+        salary = ""
+        if isinstance(ph, list):
+            for p in ph:
+                if isinstance(p, dict) and p.get("type") == "salary":
+                    salary = (p.get("label") or "").strip()
+                    break
+
         posted = (row.get("footerPlaceholderLabel") or row.get("createdDate")
                   or row.get("postedDate") or "").strip()
-        description = (row.get("jobDescription") or row.get("description") or "").strip()
-        # `jdURL` is the canonical absolute URL; fall back to title-slug if absent.
+        desc = (row.get("jobDescription") or row.get("description") or "").strip()
+        if salary:
+            desc = f"💰 {salary}\n{desc}" if desc else f"💰 {salary}"
+
         url = row.get("jdURL") or row.get("jdUrl") or row.get("url") or ""
         if url and not url.startswith("http"):
             url = f"https://www.naukri.com{url}"
+
         return Job(
             job_id=job_id,
             title=title,
@@ -209,92 +155,103 @@ def _parse_api_row(row: dict, query: str) -> Job | None:
             location=location,
             experience=experience,
             posted=posted,
-            description=description,
+            description=desc,
             url=url,
             query=query,
         )
     except Exception as e:
-        log.debug("scraper: parse row failed: %s row_keys=%s", e, list(row.keys())[:10])
+        log.debug("scraper: parse row failed: %s", e)
         return None
 
 
-def _api_search(query: str, experience_years: int, headers: dict, cookies: dict,
-                max_pages: int = 2) -> list[Job]:
-    """Call /jobapi/v3/search for one query, paging up to `max_pages`."""
-    jobs: list[Job] = []
-    for page_no in range(1, max_pages + 1):
-        params = {
-            "noOfResults": 20,
-            "urlType": "search_by_keyword",
-            "searchType": "adv",
-            "keyword": query,
-            "pageNo": page_no,
-            "experience": experience_years,
-            "k": query,
-            "seoKey": query.lower().replace(" ", "-") + "-jobs",
-            "src": "jobsearchDesk",
-            "latLong": "",
-        }
+def _scrape_one_page(page, url: str, query: str) -> list[Job]:
+    try:
+        resp = page.goto(url, wait_until="domcontentloaded", timeout=30000)
+        status = resp.status if resp is not None else "n/a"
+    except PWTimeout as e:
+        log.warning("scraper: goto timeout q=%r url=%s err=%s", query, url, e)
+        return []
+    except Exception as e:
+        log.warning("scraper: goto failed q=%r url=%s err=%s", query, url, e)
+        return []
+
+    if status != 200:
+        log.warning("scraper: SRP non-200 q=%r status=%s url=%s", query, status, url)
+        return []
+
+    html = page.content() or ""
+    m = _NEXT_DATA_RE.search(html)
+    if not m:
+        # Either Next.js layout changed, or page is a captcha / interstitial.
+        title = ""
         try:
-            r = requests.get(API_URL, params=params, headers=headers,
-                             cookies=cookies, timeout=20)
-        except requests.RequestException as e:
-            log.warning("scraper: api request failed q=%r page=%d err=%s",
-                        query, page_no, e)
-            break
-        if r.status_code != 200:
-            body_snip = (r.text or "")[:300].replace("\n", " ")
-            log.warning("scraper: api non-200 q=%r page=%d status=%d body=%r",
-                        query, page_no, r.status_code, body_snip)
-            break
-        try:
-            data = r.json()
-        except ValueError as e:
-            log.warning("scraper: api non-json q=%r page=%d err=%s body=%r",
-                        query, page_no, e, (r.text or "")[:200])
-            break
-        rows = data.get("jobDetails") or data.get("jobs") or []
-        if not rows:
-            log.info("scraper: api q=%r page=%d returned 0 rows (keys=%s)",
-                     query, page_no, list(data.keys())[:10])
-            break
-        page_jobs = [j for j in (_parse_api_row(row, query) for row in rows) if j]
-        jobs.extend(page_jobs)
-        log.info("scraper: api q=%r page=%d rows=%d parsed=%d cumulative=%d",
-                 query, page_no, len(rows), len(page_jobs), len(jobs))
-        if len(rows) < 20:  # last page
-            break
-        time.sleep(0.8)
+            title = page.title() or ""
+        except Exception:
+            pass
+        log.warning("scraper: __NEXT_DATA__ not found q=%r status=%s title=%r "
+                    "html_head=%r", query, status, title[:120],
+                    html[:300].replace("\n", " "))
+        return []
+
+    try:
+        data = json.loads(m.group(1))
+    except json.JSONDecodeError as e:
+        log.warning("scraper: __NEXT_DATA__ JSON parse failed q=%r err=%s", query, e)
+        return []
+
+    rows = _walk_for_job_rows(data)
+    if not rows:
+        # Log a hint of the JSON shape so we can map a new path if Naukri
+        # restructures.
+        top_keys = list(data.get("props", {}).get("pageProps", {}).keys())[:10] \
+            if isinstance(data.get("props"), dict) else []
+        log.warning("scraper: __NEXT_DATA__ parsed but no job rows found "
+                    "q=%r pageProps_keys=%s", query, top_keys)
+        return []
+
+    jobs = [j for j in (_parse_row(r, query) for r in rows) if j]
+    log.info("scraper: q=%r rows=%d parsed=%d", query, len(rows), len(jobs))
     return jobs
 
 
 def scrape_all(queries: Iterable[str], experience_years: int,
-               locations: list[str]) -> list[Job]:
-    """Harvest fresh API credentials, then call the Naukri JSON search API for
-    every query. Returns a flat list of Job rows.
+               locations: list[str], max_pages: int = 2) -> list[Job]:
+    """For each query, load the SRP and extract jobs from the SSR'd JSON.
 
-    `locations` is currently ignored at the API layer — Naukri's API supports a
-    city-id filter we don't yet resolve. Per-user location filtering already
-    happens in `app.filters` against the pool.
+    One Chromium session is reused across all queries — much lighter than
+    one navigation per query in a fresh browser.
     """
     queries = list(queries)
     out: list[Job] = []
 
-    creds = _harvest_credentials()
-    if not creds:
-        log.error("scraper: no credentials harvested — returning 0 jobs. "
-                  "Check Render logs above for warmup status/title.")
-        return out
-    headers, cookies = creds
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch(headless=True, args=[
+            "--disable-blink-features=AutomationControlled",
+            "--no-sandbox",
+        ])
+        context = browser.new_context(
+            user_agent=_UA,
+            viewport={"width": 1366, "height": 900},
+            locale="en-US",
+        )
+        page = context.new_page()
+        stealth_sync(page)
 
-    for q in queries:
-        try:
-            got = _api_search(q, experience_years, headers, cookies)
-            log.info("scraper: q=%r total=%d", q, len(got))
-            out.extend(got)
-        except Exception as e:
-            log.exception("scraper: q=%r failed: %s", q, e)
-        time.sleep(0.5)
+        for q in queries:
+            for pn in range(1, max_pages + 1):
+                url = build_url(q, experience_years, locations, page_no=pn)
+                try:
+                    got = _scrape_one_page(page, url, q)
+                except Exception as e:
+                    log.exception("scraper: q=%r page=%d failed: %s", q, pn, e)
+                    got = []
+                if not got:
+                    break  # No point loading page 2 if page 1 was empty.
+                out.extend(got)
+                time.sleep(1.2)
+            time.sleep(0.6)
+
+        browser.close()
 
     log.info("scraper: total_jobs=%d across %d queries", len(out), len(queries))
     return out
