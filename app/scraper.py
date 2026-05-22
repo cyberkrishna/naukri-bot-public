@@ -82,6 +82,9 @@ def _harvest_credentials() -> tuple[dict[str, str], dict[str, str]] | None:
     the page load (CSRF, session, etc.).
     """
     captured: dict[str, str] = {}
+    # Track every /jobapi/* request we observe so we can debug when nkparam
+    # isn't appearing (wrong endpoint? renamed header? no XHR at all?).
+    seen_jobapi_urls: list[str] = []
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True, args=[
@@ -97,12 +100,17 @@ def _harvest_credentials() -> tuple[dict[str, str], dict[str, str]] | None:
         stealth_sync(page)
 
         def _on_request(req):
-            if "jobapi/v3/search" in req.url and "nkparam" not in captured:
-                tok = req.headers.get("nkparam")
-                if tok:
-                    captured["nkparam"] = tok
-                    log.info("scraper: harvested nkparam (len=%d) from %s",
-                             len(tok), req.url[:120])
+            if "/jobapi/" not in req.url:
+                return
+            # Always log so we can SEE what the page is calling.
+            hdr_keys = sorted(req.headers.keys())
+            seen_jobapi_urls.append(req.url)
+            log.info("scraper: jobapi request url=%s headers=%s",
+                     req.url[:160], hdr_keys)
+            if "nkparam" in req.headers and "nkparam" not in captured:
+                captured["nkparam"] = req.headers["nkparam"]
+                log.info("scraper: harvested nkparam (len=%d)",
+                         len(captured["nkparam"]))
 
         page.on("request", _on_request)
 
@@ -110,19 +118,40 @@ def _harvest_credentials() -> tuple[dict[str, str], dict[str, str]] | None:
             resp = page.goto(WARMUP_URL, wait_until="domcontentloaded", timeout=30000)
             status = resp.status if resp is not None else "n/a"
             log.info("scraper: warmup status=%s url=%s", status, WARMUP_URL)
-            # Give Naukri's JS time to fire the search XHR.
             try:
-                page.wait_for_load_state("networkidle", timeout=15000)
+                page.wait_for_load_state("networkidle", timeout=10000)
             except PWTimeout:
                 pass
-            # Some builds fire the XHR after a brief delay even past networkidle.
-            page.wait_for_timeout(2000)
+
+            # The first SRP is server-rendered, so no /jobapi/v3/search XHR
+            # fires on initial load. Force one by triggering an in-page
+            # interaction that Naukri handles client-side via the API:
+            # navigating to page 2 of results. The pageNo=2 variant of the
+            # search URL always uses the JSON API for hydration.
+            if "nkparam" not in captured:
+                try:
+                    page.goto(WARMUP_URL + "&pageNo=2",
+                              wait_until="domcontentloaded", timeout=20000)
+                    page.wait_for_timeout(2500)
+                except Exception as e:
+                    log.warning("scraper: pageNo=2 nav failed: %s", e)
+
+            # Last-resort: scroll to trigger any lazy XHR.
+            if "nkparam" not in captured:
+                try:
+                    for _ in range(3):
+                        page.mouse.wheel(0, 1500)
+                        page.wait_for_timeout(700)
+                except Exception:
+                    pass
+
         except Exception as e:
             log.warning("scraper: warmup navigation failed: %s", e)
 
-        # Even if the listener didn't fire, the cookies are useful diagnostic
-        # signal — and may be enough on their own for some endpoints.
         cookie_list = context.cookies()
+        if not seen_jobapi_urls:
+            log.warning("scraper: NO /jobapi/* requests observed at all — "
+                        "page may be fully SSR'd or blocked by JS")
         browser.close()
 
     if "nkparam" not in captured:
