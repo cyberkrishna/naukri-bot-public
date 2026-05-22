@@ -70,14 +70,23 @@ def _row_to_job(row: pd.Series, query: str) -> Job | None:
             return str(v).strip()
 
         posted = _clean(row.get("date_posted"))
-        description = _clean(row.get("description"))
+        raw_desc = _clean(row.get("description"))
         title = _clean(row.get("title"))
         company = _clean(row.get("company"))
         location = _clean(row.get("location"))
         experience = _clean(row.get("experience_range") or row.get("job_level"))
 
-        # Salary: JobSpy normalises into min_amount/max_amount/currency/interval.
-        sal_parts = []
+        # Build a structured prefix block that the formatter parses back out.
+        # Format: each line is "KEY: value", followed by a "---" separator,
+        # followed by the raw job description. Keep it human-readable too in
+        # case anyone reads description directly.
+        meta_lines: list[str] = []
+
+        site = _clean(row.get("site"))
+        if site:
+            meta_lines.append(f"SRC: {site}")
+
+        # Salary
         min_amt, max_amt = row.get("min_amount"), row.get("max_amount")
         min_ok = pd.notna(min_amt) if min_amt is not None else False
         max_ok = pd.notna(max_amt) if max_amt is not None else False
@@ -85,19 +94,37 @@ def _row_to_job(row: pd.Series, query: str) -> Job | None:
             cur = _clean(row.get("currency")) or "INR"
             interval = _clean(row.get("interval")) or "yearly"
             if min_ok and max_ok:
-                sal_parts.append(f"{cur} {int(min_amt):,}–{int(max_amt):,} / {interval}")
+                sal = f"{cur} {int(min_amt):,}–{int(max_amt):,} / {interval}"
             elif min_ok:
-                sal_parts.append(f"{cur} {int(min_amt):,}+ / {interval}")
+                sal = f"{cur} {int(min_amt):,}+ / {interval}"
             else:
-                sal_parts.append(f"up to {cur} {int(max_amt):,} / {interval}")
-        if sal_parts:
-            salary_line = "💰 " + sal_parts[0]
-            description = f"{salary_line}\n{description}" if description else salary_line
+                sal = f"up to {cur} {int(max_amt):,} / {interval}"
+            meta_lines.append(f"SALARY: {sal}")
 
-        # Source tag in description so users can see where it came from.
-        site = (row.get("site") or "").strip()
-        if site:
-            description = f"[{site}] {description}" if description else f"[{site}]"
+        # Remote
+        if bool(row.get("is_remote")):
+            meta_lines.append("REMOTE: yes")
+
+        # Job type (full-time / intern / contract / etc.) — often None on Indeed.
+        jtype = _clean(row.get("job_type"))
+        if jtype and jtype.lower() != "none":
+            meta_lines.append(f"TYPE: {jtype}")
+
+        # Skills — list or comma-string depending on site.
+        skills_raw = row.get("skills")
+        if isinstance(skills_raw, (list, tuple)):
+            skills = ", ".join(str(x).strip() for x in skills_raw if str(x).strip())
+        else:
+            skills = _clean(skills_raw)
+        if skills:
+            meta_lines.append(f"SKILLS: {skills}")
+
+        # Assemble. Separator must be exactly "---" on its own line so the
+        # formatter can split unambiguously.
+        if meta_lines:
+            description = "\n".join(meta_lines) + "\n---\n" + raw_desc
+        else:
+            description = raw_desc
 
         return Job(
             job_id=job_id,
@@ -106,7 +133,7 @@ def _row_to_job(row: pd.Series, query: str) -> Job | None:
             location=location,
             experience=experience,
             posted=posted,
-            description=description[:4000],  # keep DB row small
+            description=description[:6000],  # keep DB row small
             url=url,
             query=query,
         )
