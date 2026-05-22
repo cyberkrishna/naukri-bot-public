@@ -30,17 +30,52 @@ def passes(
         if not _is_recent(job.posted, posted_within_days):
             return False
 
-    if require_zero_experience and not _is_zero_experience(job.experience):
+    if require_zero_experience and not _is_zero_experience(job.experience, h):
         return False
 
     return True
 
 
-def _is_zero_experience(exp: str) -> bool:
-    """True only if posting requires 0 years (fresher / 0-x range)."""
-    if not exp:
-        return False
-    e = exp.lower().strip()
+# Words/phrases that signal the job is fresher-friendly even without a
+# numeric experience range. Indeed/LinkedIn rarely expose Naukri-style
+# "0-3 yrs" strings, so we look in the full haystack (title + description
+# + experience). We're permissive here: a job with no experience signal
+# either way is treated as fresher-eligible so we don't filter to zero.
+_FRESHER_HINTS = (
+    "fresher", "freshers", "intern", "internship",
+    "entry level", "entry-level", "graduate", "trainee",
+    "no experience", "0+ years", "0-1 year", "0 year",
+)
+
+# Words that strongly suggest senior-only roles. Used to REJECT jobs when
+# require_zero_experience is true and we have no positive fresher signal.
+_SENIOR_HINTS = (
+    "senior", "sr.", "sr ", "lead ", "principal", "staff engineer",
+    "manager", "director", "head of", "architect",
+)
+
+# Regex that catches "N+ years" / "N years experience" for any N >= 3.
+_SENIOR_YEARS_RE = re.compile(
+    r"\b([3-9]|1[0-9])\s*\+?\s*(?:years?|yrs?)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_zero_experience(exp: str, haystack: str = "") -> bool:
+    """True if posting looks fresher-eligible.
+
+    Strategy:
+      1. If experience field has explicit 0-N years range or 'fresher' → True.
+      2. If experience field has positive N-year range (N>0) → False.
+      3. Otherwise fall back to scanning the haystack: positive fresher hints
+         → True; senior-only hints with no fresher hint → False.
+      4. No signal either way → True (don't filter to zero on platforms
+         like Indeed/LinkedIn that don't surface a clean experience range).
+    """
+    e = (exp or "").lower().strip()
+    h = (haystack or "").lower()
+
+    # 1. Explicit fresher signal in the structured experience field.
     if "fresher" in e:
         return True
     m = re.search(r"(\d+)\s*[-–to ]+\s*\d+\s*yr", e)
@@ -49,7 +84,19 @@ def _is_zero_experience(exp: str) -> bool:
     m = re.search(r"^(\d+)\s*yr", e)
     if m:
         return int(m.group(1)) == 0
-    return False
+
+    # 2. No structured experience — fall back to text hints.
+    has_fresher_hint = any(hint in h for hint in _FRESHER_HINTS)
+    if has_fresher_hint:
+        return True
+    has_senior_hint = any(hint in h for hint in _SENIOR_HINTS)
+    if has_senior_hint:
+        return False
+    if _SENIOR_YEARS_RE.search(h):
+        return False
+
+    # 3. Neither positive nor negative signal — treat as eligible.
+    return True
 
 
 def _is_recent(posted: str, within_days: int) -> bool:
