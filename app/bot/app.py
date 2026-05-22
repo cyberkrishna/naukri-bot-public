@@ -7,6 +7,7 @@ from app.bot.handlers import (
     help_cmd,
     pause,
     resume,
+    scrape_now,
     set_exclude,
     set_experience,
     set_frequency,
@@ -77,6 +78,7 @@ def build_app() -> Application:
     application.add_handler(CommandHandler("resume", resume))
     application.add_handler(CommandHandler("unsubscribe", unsubscribe))
     application.add_handler(CommandHandler("test_deliver", test_deliver))
+    application.add_handler(CommandHandler("scrape_now", scrape_now))
     return application
 
 

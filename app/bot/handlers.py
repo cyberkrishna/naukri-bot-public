@@ -5,10 +5,13 @@ from telegram import Update
 from telegram.constants import ParseMode
 from telegram.ext import ContextTypes
 
+from sqlalchemy import func, select
+
 from app.config import ADMIN_CHAT_ID
 from app.db import session_scope
 from app.delivery import deliver_one
-from app.models import SentJob, User
+from app.models import JobPool, SentJob, User
+from app.scheduler import scrape_job
 
 WELCOME = (
     "👋 Welcome to the Naukri Job Alerts bot.\n\n"
@@ -346,5 +349,43 @@ async def test_deliver(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
     sent, failed = await asyncio.to_thread(deliver_one, chat.id, False)
     await update.message.reply_text(
         f"✅ delivery done: jobs_sent={sent} batches_failed={failed}",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+def _pool_count() -> int:
+    with session_scope() as s:
+        return int(s.execute(select(func.count()).select_from(JobPool)).scalar() or 0)
+
+
+async def scrape_now(update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: force an immediate scrape run.
+
+    Playwright is sync and the full scrape can take several minutes, so we
+    hand it to a thread. Report pool delta + total so the admin can confirm
+    new rows actually landed.
+    """
+    chat = update.effective_chat
+    if chat is None:
+        return
+    if ADMIN_CHAT_ID == 0 or chat.id != ADMIN_CHAT_ID:
+        return  # silently ignore for non-admins
+    await update.message.reply_text(
+        "⏳ Running scrape now… this can take several minutes. I'll reply when it's done.",
+        parse_mode=ParseMode.HTML,
+    )
+    before = await asyncio.to_thread(_pool_count)
+    try:
+        await asyncio.to_thread(scrape_job.run, False)
+    except Exception as e:
+        await update.message.reply_text(
+            f"❌ scrape failed: <code>{type(e).__name__}: {e}</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    after = await asyncio.to_thread(_pool_count)
+    new_rows = after - before
+    await update.message.reply_text(
+        f"✅ scrape done: pool_before={before} pool_after={after} new={new_rows}",
         parse_mode=ParseMode.HTML,
     )
