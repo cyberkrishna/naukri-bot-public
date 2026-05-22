@@ -1,18 +1,20 @@
-"""Scrape Naukri by extracting the SSR'd __NEXT_DATA__ JSON from search pages.
+"""Scrape Naukri search result pages.
 
-Naukri is a Next.js app — every search results page embeds the full job
-listing as JSON inside `<script id="__NEXT_DATA__">`. We load each query's
-SRP with Playwright (one Chromium session reused across queries) and parse
-the JSON straight out of the HTML.
+Naukri runs on Next.js 13+ App Router (RSC). The SRP HTML loads fine from
+Render's IP (warmup returns 200), but:
+  - The legacy `<script id="__NEXT_DATA__">` blob no longer exists.
+  - The JSON API (`/jobapi/v3/search`) returns 406 "recaptcha required".
 
-Why this beats every other path:
-- No /jobapi/v3/search call → no `recaptcha required` 406s (which is what
-  the JSON API returns from Render's IP).
-- No `nkparam` token to harvest, no header signing to reverse-engineer.
-- No fragile CSS selectors — the JSON shape is what Next.js ships to its
-  own client-side hydration, far more stable than rendered DOM classes.
-- Cookies + stealth make the HTML page itself reachable; that's the only
-  thing we need.
+So the only viable path from a cloud IP is to render the SRP with Playwright
+and read job data out of the rendered DOM after React hydrates. We do this
+once per query × page, reusing one Chromium session across queries.
+
+We try two extraction paths, in order:
+  1. Parse the Flight RSC payload from `<script>self.__next_f.push([...])</script>`
+     chunks. Cleanest — gives us the same JSON the React tree consumes.
+  2. Wait for the job-card selector to appear (proves hydration completed),
+     then read fields directly from the DOM. Resilient to Flight payload
+     restructuring.
 """
 import json
 import logging
@@ -30,11 +32,17 @@ log = logging.getLogger("scraper")
 _UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
        "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
 
-# Matches the Next.js data script tag. Naukri uses the standard Next layout.
-_NEXT_DATA_RE = re.compile(
-    r'<script id="__NEXT_DATA__"[^>]*>(.+?)</script>',
+# Matches each Flight payload chunk Next.js streams into the page.
+# The arg is a JSON-encoded string (with escaped quotes) we then re-parse.
+_FLIGHT_RE = re.compile(
+    r'self\.__next_f\.push\((\[[^\)]+\])\)',
     re.DOTALL,
 )
+
+# Job card selectors Naukri's SRP renders post-hydration. Multiple variants
+# so we don't break on a minor class rename.
+_CARD_SELECTOR = ("div.srp-jobtuple-wrapper, article.jobTuple, "
+                  "div[data-job-id], div.jobTupleHeader")
 
 
 @dataclass
@@ -67,30 +75,29 @@ def build_url(query: str, experience_years: int, locations: list[str],
     return url
 
 
-def _walk_for_job_rows(obj) -> list[dict]:
-    """Recursively walk a JSON tree looking for the Naukri jobs array.
+def _extract_job_id(href: str) -> str:
+    m = re.search(r"-(\d+)(?:\?|$)", href)
+    return m.group(1) if m else href
 
-    Naukri's __NEXT_DATA__ shape is roughly:
-      props.pageProps.jobDetails / .srpResultDetails.jobDetails / etc.
-    Rather than hardcode the path (it has shifted across rewrites), we
-    walk the tree and pick the first list whose items look like Naukri job
-    rows. A Naukri job row reliably has a `jobId` key.
+
+# --- Path 1: Flight RSC payload --------------------------------------------
+
+def _walk_for_job_rows(obj) -> list[dict]:
+    """Walk a JSON tree, returning every list of Naukri job rows we find.
+
+    A Naukri job row reliably has both `jobId` and `title` keys.
     """
     found: list[dict] = []
 
-    def _is_job_row(d) -> bool:
-        if not isinstance(d, dict):
-            return False
-        # jobId / title / companyName are the stable trio.
-        has_id = any(k in d for k in ("jobId", "jobid"))
-        has_title = "title" in d
-        return has_id and has_title
+    def _is_row(d) -> bool:
+        return (isinstance(d, dict)
+                and ("jobId" in d or "jobid" in d)
+                and "title" in d)
 
     def _walk(node):
         if isinstance(node, list):
-            if node and _is_job_row(node[0]):
-                found.extend(item for item in node if _is_job_row(item))
-                # Don't return — there may be multiple lists (e.g. ads).
+            if node and _is_row(node[0]):
+                found.extend(x for x in node if _is_row(x))
             for item in node:
                 _walk(item)
         elif isinstance(node, dict):
@@ -98,7 +105,6 @@ def _walk_for_job_rows(obj) -> list[dict]:
                 _walk(v)
 
     _walk(obj)
-    # Dedup by jobId in case multiple list paths overlap.
     seen: set[str] = set()
     uniq: list[dict] = []
     for r in found:
@@ -109,7 +115,7 @@ def _walk_for_job_rows(obj) -> list[dict]:
     return uniq
 
 
-def _parse_row(row: dict, query: str) -> Job | None:
+def _parse_flight_row(row: dict, query: str) -> Job | None:
     try:
         job_id = str(row.get("jobId") or row.get("jobid") or "")
         if not job_id:
@@ -118,25 +124,19 @@ def _parse_row(row: dict, query: str) -> Job | None:
         company = (row.get("companyName") or row.get("company") or "").strip()
         experience = (row.get("experienceText") or row.get("experience") or "").strip()
 
-        # Location: prefer placeholders[type=location].label; fall back to flat fields.
         location = ""
+        salary = ""
         ph = row.get("placeholders") or []
         if isinstance(ph, list):
             for p in ph:
-                if isinstance(p, dict) and p.get("type") == "location":
+                if not isinstance(p, dict):
+                    continue
+                if p.get("type") == "location" and not location:
                     location = (p.get("label") or "").strip()
-                    break
+                elif p.get("type") == "salary" and not salary:
+                    salary = (p.get("label") or "").strip()
         if not location:
             location = (row.get("location") or row.get("locationText") or "").strip()
-
-        # Salary placeholder (helpful free signal; we don't model it yet but
-        # show it in description so users can see).
-        salary = ""
-        if isinstance(ph, list):
-            for p in ph:
-                if isinstance(p, dict) and p.get("type") == "salary":
-                    salary = (p.get("label") or "").strip()
-                    break
 
         posted = (row.get("footerPlaceholderLabel") or row.get("createdDate")
                   or row.get("postedDate") or "").strip()
@@ -148,21 +148,111 @@ def _parse_row(row: dict, query: str) -> Job | None:
         if url and not url.startswith("http"):
             url = f"https://www.naukri.com{url}"
 
-        return Job(
-            job_id=job_id,
-            title=title,
-            company=company,
-            location=location,
-            experience=experience,
-            posted=posted,
-            description=desc,
-            url=url,
-            query=query,
-        )
+        return Job(job_id=job_id, title=title, company=company, location=location,
+                   experience=experience, posted=posted, description=desc,
+                   url=url, query=query)
     except Exception as e:
-        log.debug("scraper: parse row failed: %s", e)
+        log.debug("scraper: flight row parse failed: %s", e)
         return None
 
+
+def _extract_from_flight(html: str, query: str) -> list[Job]:
+    """Parse all `self.__next_f.push([...])` chunks, search the merged JSON
+    tree for job rows."""
+    chunks = _FLIGHT_RE.findall(html)
+    if not chunks:
+        return []
+
+    payloads: list = []
+    for raw in chunks:
+        try:
+            outer = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        # Each push is [tag, "json-string"] — the second element is the
+        # actual Flight payload as a string.
+        if not isinstance(outer, list) or len(outer) < 2:
+            continue
+        inner = outer[1]
+        if not isinstance(inner, str):
+            continue
+        # The Flight payload is line-delimited; each non-empty line is either
+        # a model reference (e.g. `0:"$Sreact.suspense"`) or
+        # `<index>:<JSON>`. We try every JSON-looking suffix.
+        for line in inner.splitlines():
+            colon = line.find(":")
+            if colon < 0:
+                continue
+            tail = line[colon + 1:]
+            if not tail or tail[0] not in "[{":
+                continue
+            try:
+                payloads.append(json.loads(tail))
+            except json.JSONDecodeError:
+                continue
+
+    rows: list[dict] = []
+    for p in payloads:
+        rows.extend(_walk_for_job_rows(p))
+    if not rows:
+        return []
+
+    # Dedup once more across payloads.
+    seen: set[str] = set()
+    jobs: list[Job] = []
+    for r in rows:
+        jid = str(r.get("jobId") or r.get("jobid") or "")
+        if not jid or jid in seen:
+            continue
+        seen.add(jid)
+        j = _parse_flight_row(r, query)
+        if j:
+            jobs.append(j)
+    return jobs
+
+
+# --- Path 2: DOM after hydration -------------------------------------------
+
+def _extract_from_dom(page, query: str) -> list[Job]:
+    """Read job rows from the rendered DOM. Used when Flight parsing yields
+    nothing — slower but resilient to payload-shape changes."""
+    cards = page.query_selector_all(_CARD_SELECTOR)
+    jobs: list[Job] = []
+    for c in cards:
+        try:
+            link_el = c.query_selector("a.title, a.title-link, a[href*='-jobs-']")
+            if not link_el:
+                continue
+            href = link_el.get_attribute("href") or ""
+            title = (link_el.inner_text() or "").strip()
+            company_el = c.query_selector("a.comp-name, a.subTitle, span.comp-name")
+            company = (company_el.inner_text().strip() if company_el else "")
+            exp_el = c.query_selector("span.exp-wrap, span.expwdth, li.experience, span.exp")
+            experience = (exp_el.inner_text().strip() if exp_el else "")
+            loc_el = c.query_selector("span.loc-wrap, span.locWdth, li.location, span.loc")
+            location = (loc_el.inner_text().strip() if loc_el else "")
+            desc_el = c.query_selector("span.job-desc, span.job-description")
+            description = (desc_el.inner_text().strip() if desc_el else "")
+            sal_el = c.query_selector("span.sal-wrap, span.salWdth, span.sal, li.salary")
+            salary = (sal_el.inner_text().strip() if sal_el else "")
+            if salary:
+                description = f"💰 {salary}\n{description}" if description else f"💰 {salary}"
+            posted_el = c.query_selector("span.job-post-day, span.fleft.postedDate, span.post-day")
+            posted = (posted_el.inner_text().strip() if posted_el else "")
+
+            jobs.append(Job(
+                job_id=_extract_job_id(href),
+                title=title, company=company, location=location,
+                experience=experience, posted=posted, description=description,
+                url=href if href.startswith("http") else f"https://www.naukri.com{href}",
+                query=query,
+            ))
+        except Exception as e:
+            log.debug("scraper: DOM card parse failed q=%r: %s", query, e)
+    return jobs
+
+
+# --- Driver ----------------------------------------------------------------
 
 def _scrape_one_page(page, url: str, query: str) -> list[Job]:
     try:
@@ -179,48 +269,48 @@ def _scrape_one_page(page, url: str, query: str) -> list[Job]:
         log.warning("scraper: SRP non-200 q=%r status=%s url=%s", query, status, url)
         return []
 
-    html = page.content() or ""
-    m = _NEXT_DATA_RE.search(html)
-    if not m:
-        # Either Next.js layout changed, or page is a captcha / interstitial.
-        title = ""
-        try:
-            title = page.title() or ""
-        except Exception:
-            pass
-        log.warning("scraper: __NEXT_DATA__ not found q=%r status=%s title=%r "
-                    "html_head=%r", query, status, title[:120],
-                    html[:300].replace("\n", " "))
-        return []
-
+    # Wait for hydration: either the job-card selector appears in the DOM,
+    # or networkidle fires (Flight chunks all streamed in).
+    hydrated = False
     try:
-        data = json.loads(m.group(1))
-    except json.JSONDecodeError as e:
-        log.warning("scraper: __NEXT_DATA__ JSON parse failed q=%r err=%s", query, e)
-        return []
+        page.wait_for_selector(_CARD_SELECTOR, timeout=15000)
+        hydrated = True
+    except PWTimeout:
+        try:
+            page.wait_for_load_state("networkidle", timeout=8000)
+        except PWTimeout:
+            pass
 
-    rows = _walk_for_job_rows(data)
-    if not rows:
-        # Log a hint of the JSON shape so we can map a new path if Naukri
-        # restructures.
-        top_keys = list(data.get("props", {}).get("pageProps", {}).keys())[:10] \
-            if isinstance(data.get("props"), dict) else []
-        log.warning("scraper: __NEXT_DATA__ parsed but no job rows found "
-                    "q=%r pageProps_keys=%s", query, top_keys)
-        return []
+    html = page.content() or ""
 
-    jobs = [j for j in (_parse_row(r, query) for r in rows) if j]
-    log.info("scraper: q=%r rows=%d parsed=%d", query, len(rows), len(jobs))
-    return jobs
+    # Try Flight RSC payload first.
+    jobs = _extract_from_flight(html, query)
+    if jobs:
+        log.info("scraper: q=%r flight_jobs=%d (hydrated=%s)",
+                 query, len(jobs), hydrated)
+        return jobs
+
+    # Fall back to DOM. If hydration never completed, this will be empty.
+    jobs = _extract_from_dom(page, query)
+    if jobs:
+        log.info("scraper: q=%r dom_jobs=%d (hydrated=%s, flight_empty)",
+                 query, len(jobs), hydrated)
+        return jobs
+
+    # Neither path worked — emit one diagnostic line so we can iterate.
+    title = ""
+    try:
+        title = page.title() or ""
+    except Exception:
+        pass
+    flight_chunks = len(_FLIGHT_RE.findall(html))
+    log.warning("scraper: q=%r ZERO jobs hydrated=%s flight_chunks=%d title=%r "
+                "html_len=%d", query, hydrated, flight_chunks, title[:120], len(html))
+    return []
 
 
 def scrape_all(queries: Iterable[str], experience_years: int,
                locations: list[str], max_pages: int = 2) -> list[Job]:
-    """For each query, load the SRP and extract jobs from the SSR'd JSON.
-
-    One Chromium session is reused across all queries — much lighter than
-    one navigation per query in a fresh browser.
-    """
     queries = list(queries)
     out: list[Job] = []
 
@@ -246,7 +336,7 @@ def scrape_all(queries: Iterable[str], experience_years: int,
                     log.exception("scraper: q=%r page=%d failed: %s", q, pn, e)
                     got = []
                 if not got:
-                    break  # No point loading page 2 if page 1 was empty.
+                    break
                 out.extend(got)
                 time.sleep(1.2)
             time.sleep(0.6)
